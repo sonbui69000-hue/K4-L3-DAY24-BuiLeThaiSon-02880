@@ -8,5 +8,5 @@ pytest>=8.0,<10
 # spacy
 
 # Chỉ cần nếu dùng --model claude-... thay cho --mock (không bắt buộc,
-# và KHÔNG dùng để chấm điểm — xem CHECKPOINTS.md §2).
+# và KHÔNG dùng để chấm điểm — xem CHECKPOINTS.md §2)
 # anthropic
