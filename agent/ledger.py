@@ -37,12 +37,50 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_hash = "0" * 64
+    if path.exists():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            previous_hash = json.loads(lines[-1]).get("hash", previous_hash)
+
+    record = dict(entry)
+    record["prev_hash"] = previous_hash
+    payload = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    record["hash"] = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    return record
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return True
+
+    previous_hash = "0" * 64
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if not record.get("reason") or record.get("prev_hash") != previous_hash:
+                return False
+            stored_hash = record.get("hash")
+            unsigned = dict(record)
+            unsigned.pop("hash", None)
+            payload = json.dumps(unsigned, ensure_ascii=False, sort_keys=True)
+            expected_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+            if stored_hash != expected_hash:
+                return False
+            previous_hash = stored_hash
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+    return True

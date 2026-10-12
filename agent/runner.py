@@ -59,7 +59,15 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, tools
+from agent.policy import PolicyContext, check
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
@@ -71,4 +79,121 @@ class RunnerScaffoldPending(NotImplementedError):
 
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) if log_dir is not None else REPORTS_DIR) / "ledger.jsonl"
+    run_token = uuid.uuid4().hex
+    agent_id = "lab24-agent"
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat().replace("+00:00", "Z")
+    broad_agent_scopes = ("search_docs", "read_customer", "http_post")
+
+    def invoke(
+        tool_name: str,
+        args: dict,
+        classification: str,
+        purpose: str,
+        egress_enabled: bool,
+        run_tag: str,
+        callback,
+    ):
+        run_id = f"{run_token}-{run_tag}"
+        context = PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=f"{agent_id}/{run_tag}",
+            delegation_depth=0,
+            egress_enabled=egress_enabled,
+            principal_id=principal_id,
+            requested_tool=tool_name,
+            agent_scopes=broad_agent_scopes,
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        allowed, reason = check(context)
+        args_hash = hashlib.sha256(
+            json.dumps(args, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "tool": tool_name,
+                "args_hash": args_hash,
+                "classification": classification,
+                "decision": "allow" if allowed else "deny",
+                "reason": reason,
+                "on_behalf_of": principal_id,
+                "expires_at": expires_at,
+            },
+            ledger_path,
+        )
+        if not allowed:
+            return None
+        return callback()
+
+    docs = invoke(
+        "search_docs",
+        {"query": message},
+        "internal",
+        "summarize-tickets",
+        False,
+        "run-a",
+        lambda: tools.search_docs(message),
+    ) or []
+
+    safe_docs = [
+        {"id": document["id"], "text": pii.redact(document["text"])}
+        for document in docs
+    ]
+    combined_text = "\n\n".join(document["text"] for document in safe_docs)
+    injected = llm.find_injection(combined_text)
+
+    ticket_ids: list[int] = []
+    for document in safe_docs:
+        match = re.fullmatch(r"ticket-(\d+)(?:b)?\.md", document["id"])
+        if match:
+            ticket_ids.append(int(match.group(1)))
+    ticket_ids = sorted(set(ticket_ids))
+
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    customer_ids: list[str] = []
+    for ticket_id in ticket_ids:
+        for customer in customers:
+            if ticket_id in customer.get("related_tickets", []):
+                customer_id = str(customer["customer_id"])
+                if customer_id not in customer_ids:
+                    customer_ids.append(customer_id)
+
+    records: list[dict] = []
+    for customer_id in customer_ids:
+        record = invoke(
+            "read_customer",
+            {"customer_id": customer_id},
+            "restricted",
+            "support-reply",
+            False,
+            "run-b",
+            lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+        if record is not None:
+            records.append(record)
+
+    if injected is not None and records:
+        safe_records = [
+            json.loads(pii.redact(json.dumps(record, ensure_ascii=False)))
+            for record in records
+        ]
+        invoke(
+            "http_post",
+            {"url": injected.target_url},
+            "restricted",
+            "support-reply",
+            True,
+            "run-b",
+            lambda: tools.http_post(
+                injected.target_url, {"records": safe_records}
+            ),
+        )
+
+    return llm.summarize(safe_docs)

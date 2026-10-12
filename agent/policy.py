@@ -34,7 +34,10 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -51,5 +54,48 @@ class PolicyContext:
     expires_at: str = ""
 
 
+_BASE_DIR = Path(__file__).resolve().parent.parent
+_PRINCIPALS_FILE = _BASE_DIR / "data" / "principals.json"
+_CLASSIFICATIONS = {"public", "internal", "restricted"}
+
+
+def _principals() -> dict:
+    return json.loads(_PRINCIPALS_FILE.read_text(encoding="utf-8"))
+
+
+def _expiry_is_valid(value: str) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if parsed.tzinfo is None:
+        return False
+    return parsed.astimezone(timezone.utc) > datetime.now(timezone.utc)
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification not in _CLASSIFICATIONS:
+        return False, "invalid data classification"
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot use egress"
+    if not context.agent_owner:
+        return False, "agent owner is required"
+    if not isinstance(context.delegation_depth, int) or context.delegation_depth < 0:
+        return False, "invalid delegation depth"
+
+    principal = _principals().get(context.principal_id)
+    if principal is None:
+        return False, "unknown principal"
+    if context.requested_tool not in principal.get("allowed_tools", []):
+        return False, "tool is not allowed for principal"
+    if context.requested_tool not in context.agent_scopes:
+        return False, "tool is outside agent scope"
+    if context.delegation_depth > 0 and context.requested_tool not in context.parent_scopes:
+        return False, "tool is outside parent scope"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, "purpose is not allowed for principal"
+    if not _expiry_is_valid(context.expires_at):
+        return False, "authorization has expired or has no valid UTC expiry"
+    return True, "principal, scope, purpose, and expiry are valid"

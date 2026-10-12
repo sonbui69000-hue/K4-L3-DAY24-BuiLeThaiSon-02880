@@ -30,10 +30,60 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_PATTERNS = {
+    "VN_CCCD": re.compile(r"(?<!\d)\d{12}(?!\d)"),
+    "VN_PHONE": re.compile(r"(?<!\d)0(?:[\s.-]?\d){9,10}(?!\d)"),
+    "VN_BANK_ACCOUNT": re.compile(
+        r"(?i)\b(?:STK|số\s+tài\s+khoản)\s*[:#-]?\s*(\d{8,16})(?!\d)"
+    ),
+    "EMAIL": re.compile(
+        r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"
+    ),
+}
+
+_PRIORITY = {
+    "VN_BANK_ACCOUNT": 0,
+    "VN_CCCD": 1,
+    "VN_PHONE": 2,
+    "EMAIL": 3,
+}
+
+
+def _candidates(text: str) -> list[dict]:
+    found: list[dict] = []
+    for kind, pattern in _PATTERNS.items():
+        for match in pattern.finditer(text):
+            start, end = match.span(1) if kind == "VN_BANK_ACCOUNT" else match.span()
+            found.append({"type": kind, "start": start, "end": end})
+    return found
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    selected: list[dict] = []
+    candidates = sorted(
+        _candidates(text),
+        key=lambda item: (
+            item["start"],
+            -(item["end"] - item["start"]),
+            _PRIORITY[item["type"]],
+        ),
+    )
+    for candidate in candidates:
+        if not any(
+            candidate["start"] < item["end"]
+            and item["start"] < candidate["end"]
+            for item in selected
+        ):
+            selected.append(candidate)
+    return sorted(selected, key=lambda item: (item["start"], item["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    result = text
+    for entity in sorted(detect(text), key=lambda item: item["start"], reverse=True):
+        replacement = f"[REDACTED_{entity['type']}]"
+        result = result[: entity["start"]] + replacement + result[entity["end"] :]
+    return result
